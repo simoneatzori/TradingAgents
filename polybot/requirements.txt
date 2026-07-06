@@ -1,0 +1,7 @@
+# Core (engine runs and tests pass with only these)
+pydantic>=2.5,<3
+pytest>=8
+
+# Live trading only — install AFTER auditing, pin the exact version
+# py-clob-client==<pinned-audited-version>
+# web3==<pinned-audited-version>          # for one-time allowance approvals
