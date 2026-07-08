@@ -22,7 +22,8 @@ def mk_engine(tmp_path) -> Engine:
                  kill_switch_file=str(tmp_path / "KILL"),
                  bankroll=100, min_bet=1, max_bet=2,
                  max_daily_loss=5, max_daily_loss_pct=0.05,
-                 max_consecutive_losses=3, max_open_exposure=10)
+                 max_consecutive_losses=3, max_open_exposure=10,
+                 maker_enabled=False)   # maker paths tested in test_maker.py
     return Engine(s, store=Store(s.db_path),
                   notifier=TelegramNotifier("", ""))   # disabled notifier
 

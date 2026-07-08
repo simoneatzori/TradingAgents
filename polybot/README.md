@@ -32,6 +32,7 @@ CLOB book ─────┘        │            capped by remaining daily bud
 | `timeutil.py` | Server-synced clock, 5-min window alignment, entry-zone rule (no entries < 20s to close) |
 | `fees.py` | CLOB fee model `rate * min(p, 1-p)`; **hard** fee gate; tick rounding (down) |
 | `strategy.py` | `PairCostArb` (bounded downside — go live with this first) and `BrownianDirectional` (DRY_RUN data collection only) + EWMA vol with warm-up counter |
+| `maker.py` | `MakerPairQuoter`: passive two-sided pair quotes (sum ≤ 1 − MIN_EDGE) with reprice → taker-hedge → hold-with-alert escalation on one-sided fills |
 | `sizing.py` | Quarter-Kelly with probability shrinkage toward 0.5, min/max/bankroll-fraction caps, floor rounding |
 | `risk_gate.py` | Worst-case daily budget (the 1% rule) + circuit breakers: kill-switch file, daily loss, loss streak, drawdown from high-water mark, open exposure. Deny by default; halts need human reset |
 | `engine.py` | Tick orchestration, equal-shares pair execution with unhedged-leg halt, settlement loop, risk-state persistence/restore |
@@ -70,6 +71,13 @@ CLOB book ─────┘        │            capped by remaining daily bud
    by displayed liquidity, so FOK orders aren't submitted into thin books.
 8. **Live bankroll sync.** In live mode the engine sizes off
    `min(configured bankroll, actual wallet balance)`.
+9. **Maker quotes can never rest unattended.** The naked-leg worst case is
+   reserved against the daily budget at *quote* time (before anything can
+   fill); on a one-sided fill the quoter escalates reprice → taker hedge
+   (bounded by `HEDGE_MAX_LOSS_PER_SHARE`) → hold-to-settlement with alert;
+   all unfilled quotes are torn down at `QUOTE_CANCEL_REMAINING_S` before
+   close, on any halt (`go_flat`), and on restart (stale `open` orders are
+   cancelled locally, plus `cancel_all` on-exchange in live mode).
 
 ## Quick start (DRY_RUN)
 

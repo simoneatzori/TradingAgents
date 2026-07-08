@@ -37,11 +37,14 @@ from store import Store
 from strategy import BrownianDirectional, EwmaVol, PairCostArb
 from timeutil import Clock, in_entry_zone, seconds_to_close, window_bounds
 
+from maker import MAKER_STRATEGY, MakerPairQuoter
+
 log = logging.getLogger("engine")
 
 HALT_KV_KEY = "halt_reason"
 HWM_KV_KEY = "high_water_mark"
 PAIR_STRATEGY = "pair_cost_arb"
+PAIR_STRATEGIES = frozenset({PAIR_STRATEGY, MAKER_STRATEGY})
 
 
 class Engine:
@@ -80,12 +83,19 @@ class Engine:
         # directional trading is data-collection only until calibration proves it
         self.enable_directional_live = False
 
+        self.maker = (MakerPairQuoter(settings, self.store, self.gate,
+                                      self.executor, self.notifier)
+                      if settings.maker_enabled else None)
+
         self._restore_state()
 
     # ------------------------------------------------------- state restore
     def _restore_state(self) -> None:
         """Rebuild risk-gate state from the store. A process restart must
         never reset the daily loss counter, the loss streak, or a halt."""
+        stale = self.store.cancel_stale_open_orders()
+        if stale:
+            log.warning("cancelled %d stale resting orders from previous run", stale)
         reason = self.store.kv_get(HALT_KV_KEY)
         if reason:
             self.gate.halt(reason)
@@ -101,8 +111,7 @@ class Engine:
             self.gate.equity,
             float(hwm_stored) if hwm_stored else 0.0,
         )
-        self.gate.consecutive_losses = self.store.consecutive_losses(
-            exclude_strategy=PAIR_STRATEGY)
+        self.gate.consecutive_losses = self.store.consecutive_losses()
 
         for row in self.store.unsettled_filled_orders():
             fill = self.store.fill_for_order(row["client_id"])
@@ -111,9 +120,14 @@ class Engine:
             notional = float(fill["price"]) * float(fill["size"])
             self.gate.open_exposure += notional
             # completed pairs have locked-in profit -> zero residual risk;
-            # anything else (directional, unhedged leg) can lose the premium
-            # plus the entry fee already paid
-            if row["strategy"] != PAIR_STRATEGY or row["status"] == "unhedged":
+            # anything else (directional, unhedged/unmatched leg) can lose
+            # the premium plus the entry fee already paid
+            is_safe_pair = (row["strategy"] in PAIR_STRATEGIES
+                            and row["status"] != "unhedged"
+                            and self.store.matched_pair_fill(
+                                row["window_start"], row["strategy"],
+                                row["outcome"], float(fill["size"])))
+            if not is_safe_pair:
                 self.gate.open_risk += notional + float(fill["fee_paid"])
         log.info("state restored: daily_pnl=%.2f streak=%d exposure=%.2f "
                  "risk=%.2f budget_left=%.2f",
@@ -139,11 +153,24 @@ class Engine:
             self._track_window(now, spot)
 
         if self.gate.halted:
+            self.on_halt_maintenance()
             return results
+
+        books_ok = self._book_sane(yes_book) and self._book_sane(no_book)
+
+        # The maker quoter manages its own timers (place/reprice/hedge/cancel)
+        # and must run every tick — including outside the entry zone, where
+        # its job is tearing quotes down, not putting them up.
+        if self.maker is not None:
+            self.maker.tick(now, market,
+                            yes_book if books_ok else None,
+                            no_book if books_ok else None)
+
         if not in_entry_zone(now, self.s.window_seconds,
                              min_remaining_s=self.s.entry_min_remaining_s):
+            self._persist_risk_state()
             return results
-        if not self._book_sane(yes_book) or not self._book_sane(no_book):
+        if not books_ok:
             log.debug("degenerate book, skipping tick")
             return results
 
@@ -363,7 +390,7 @@ class Engine:
             size = float(fill["size"])
             notional = float(fill["price"]) * size
             payout = size if won else 0.0
-            is_pair = row["strategy"] == PAIR_STRATEGY and row["status"] != "unhedged"
+            is_pair = row["strategy"] in PAIR_STRATEGIES and row["status"] != "unhedged"
             fee_paid = float(fill["fee_paid"])
             self.settle(row["client_id"], won=won, notional=notional,
                         payout=payout, fee_paid=fee_paid,
@@ -389,9 +416,20 @@ class Engine:
             self._persist_risk_state()
             self.notifier.send(f"⛔ ENGINE HALTED after settlement: {self.gate.halt_reason}")
 
+    def on_halt_maintenance(self) -> None:
+        """A halted engine must not leave maker quotes resting: they could
+        fill while nobody is managing them. Idempotent, called every loop
+        iteration while halted."""
+        if self.maker is not None:
+            self.maker.go_flat(f"halted: {self.gate.halt_reason}")
+        self._persist_risk_state()
+
     # ------------------------------------------------------------------ run
     def startup_checks(self) -> None:
         self.s.assert_live_allowed()
+        if not self.s.dry_run and hasattr(self.executor, "cancel_all_open"):
+            # crash recovery: no order may rest on the exchange unattended
+            self.executor.cancel_all_open()
         if not self.reconciler.run():
             raise RuntimeError("reconciliation failed at startup")
         self._sync_live_bankroll()

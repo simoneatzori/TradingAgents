@@ -10,7 +10,7 @@ Safety invariants:
 from __future__ import annotations
 
 import os
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 LIVE_ACK_PHRASE = "I_UNDERSTAND_THE_RISKS"
 
@@ -35,6 +35,15 @@ class Settings(BaseModel):
     max_spread: float = 0.06                    # skip directional entries on books wider than this
     dir_min_elapsed_s: float = 60.0             # directional needs elapsed time inside the window
     vol_min_samples: int = 30                   # EWMA vol warm-up before directional trades
+
+    # --- Maker pair quoting ---
+    maker_enabled: bool = True                  # passive two-sided pair quotes
+    maker_fee_bps: int = 0                      # maker fee (verify per market metadata)
+    quote_min_remaining_s: float = 60.0         # don't post new quotes with less time left
+    quote_cancel_remaining_s: float = 30.0      # cancel unfilled quotes at T-minus this
+    quote_reprice_interval_s: float = 5.0       # min seconds between quote replacements
+    hedge_wait_s: float = 15.0                  # passive-hedge patience after a one-sided fill
+    hedge_max_loss_per_share: float = 0.01      # worst locked loss accepted to neutralize a naked leg
 
     # --- Sizing ---
     bankroll: float = 100.0
@@ -98,6 +107,21 @@ class Settings(BaseModel):
             raise ValueError("daily_profit_lock_pct must be >= 0")
         return v
 
+    @field_validator("hedge_max_loss_per_share")
+    @classmethod
+    def _hedge_loss_sane(cls, v: float) -> float:
+        if not 0 <= v <= 0.05:
+            raise ValueError("hedge_max_loss_per_share must be in [0, 0.05]")
+        return v
+
+    @model_validator(mode="after")
+    def _quote_timers_sane(self) -> "Settings":
+        if self.quote_cancel_remaining_s >= self.quote_min_remaining_s:
+            raise ValueError(
+                "quote_cancel_remaining_s must be below quote_min_remaining_s "
+                "(quotes must live long enough to be worth posting)")
+        return self
+
     @property
     def is_live(self) -> bool:
         return (not self.dry_run) and self.live_trading_ack == LIVE_ACK_PHRASE
@@ -134,6 +158,13 @@ def load_settings(env: dict | None = None) -> Settings:
         "MAX_SPREAD": ("max_spread", float),
         "DIR_MIN_ELAPSED_S": ("dir_min_elapsed_s", float),
         "VOL_MIN_SAMPLES": ("vol_min_samples", int),
+        "MAKER_ENABLED": ("maker_enabled", _bool),
+        "MAKER_FEE_BPS": ("maker_fee_bps", int),
+        "QUOTE_MIN_REMAINING_S": ("quote_min_remaining_s", float),
+        "QUOTE_CANCEL_REMAINING_S": ("quote_cancel_remaining_s", float),
+        "QUOTE_REPRICE_INTERVAL_S": ("quote_reprice_interval_s", float),
+        "HEDGE_WAIT_S": ("hedge_wait_s", float),
+        "HEDGE_MAX_LOSS_PER_SHARE": ("hedge_max_loss_per_share", float),
         "BANKROLL": ("bankroll", float),
         "KELLY_MULTIPLIER": ("kelly_multiplier", float),
         "MIN_BET": ("min_bet", float),

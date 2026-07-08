@@ -38,6 +38,7 @@ def cmd_run() -> None:
     try:
         while True:
             if engine.gate.halted:
+                engine.on_halt_maintenance()   # tear down any resting quotes
                 log.error("HALTED: %s — run `python bot.py reset` after review",
                           engine.gate.halt_reason)
                 time.sleep(10)

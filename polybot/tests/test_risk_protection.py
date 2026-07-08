@@ -27,7 +27,8 @@ def mk_settings(tmp_path, **kw) -> Settings:
                     kill_switch_file=str(tmp_path / "KILL"),
                     bankroll=100, min_bet=1, max_bet=2,
                     max_daily_loss=5, max_daily_loss_pct=0.05,
-                    max_consecutive_losses=3, max_open_exposure=10)
+                    max_consecutive_losses=3, max_open_exposure=10,
+                    maker_enabled=False)   # maker paths tested in test_maker.py
     defaults.update(kw)
     return Settings(**defaults)
 

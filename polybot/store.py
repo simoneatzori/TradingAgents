@@ -141,8 +141,16 @@ class Store:
     # ---- queries for reconciliation / reporting --------------------------
     def open_orders(self) -> list[sqlite3.Row]:
         return self.conn.execute(
-            "SELECT * FROM orders WHERE status IN ('submitted','filled','unhedged') "
+            "SELECT * FROM orders WHERE status IN ('submitted','open','filled','unhedged') "
             "AND client_id NOT IN (SELECT client_id FROM settlements)").fetchall()
+
+    def cancel_stale_open_orders(self) -> int:
+        """Startup hygiene: 'open' (resting maker) orders from a previous
+        process are unmanaged — mark them cancelled locally. Live mode also
+        cancels on-exchange via executor.cancel_all_open()."""
+        with self.tx() as c:
+            cur = c.execute("UPDATE orders SET status='cancelled' WHERE status='open'")
+            return cur.rowcount
 
     def unsettled_filled_orders(self) -> list[sqlite3.Row]:
         return self.conn.execute(
@@ -167,14 +175,20 @@ class Store:
         row = self.conn.execute("SELECT COALESCE(SUM(pnl), 0) AS p FROM settlements").fetchone()
         return float(row["p"])
 
-    def consecutive_losses(self, exclude_strategy: str = "pair_cost_arb") -> int:
+    def consecutive_losses(
+            self,
+            pair_strategies: tuple[str, ...] = ("pair_cost_arb", "pair_cost_maker"),
+    ) -> int:
         """Length of the current losing streak, newest settlement first.
-        Paired-arb legs are excluded: one leg of a profitable pair always
-        settles negative and must not poison the streak."""
+        Legs of COMPLETED pairs are excluded (one leg of a profitable pair
+        always settles negative and must not poison the streak), but naked
+        legs held to settlement ('unhedged') are real losses and count."""
+        placeholders = ",".join("?" for _ in pair_strategies)
         rows = self.conn.execute(
             "SELECT s.pnl FROM settlements s JOIN orders o ON o.client_id = s.client_id "
-            "WHERE o.strategy != ? ORDER BY s.ts DESC, s.id DESC LIMIT 100",
-            (exclude_strategy,)).fetchall()
+            f"WHERE NOT (o.strategy IN ({placeholders}) AND o.status != 'unhedged') "
+            "ORDER BY s.ts DESC, s.id DESC LIMIT 100",
+            pair_strategies).fetchall()
         streak = 0
         for r in rows:
             if r["pnl"] < 0:
@@ -182,6 +196,19 @@ class Store:
             elif r["pnl"] > 0:
                 break
         return streak
+
+    def matched_pair_fill(self, window_start: int, strategy: str,
+                          outcome: str, size: float, tol: float = 1e-6) -> bool:
+        """True when the opposite outcome of this window+strategy has filled
+        the same total size — i.e. the pair completed and carries no naked
+        risk. Used to rebuild open_risk after a restart."""
+        row = self.conn.execute(
+            "SELECT COALESCE(SUM(f.size),0) AS s FROM orders o "
+            "JOIN fills f ON f.client_id = o.client_id "
+            "WHERE o.window_start=? AND o.strategy=? AND o.outcome!=? "
+            "AND o.status='filled'",
+            (window_start, strategy, outcome)).fetchone()
+        return abs(float(row["s"]) - size) <= tol
 
     def pnl_by_strategy(self) -> dict[str, float]:
         rows = self.conn.execute(

@@ -164,6 +164,11 @@ class RiskGate:
         self.open_exposure += notional
         self.open_risk += notional if worst_case_loss is None else worst_case_loss
 
+    def reserve_risk(self, amount: float) -> None:
+        """Reserve worst-case budget BEFORE exposure exists — e.g. resting
+        maker quotes that may fill later. Pair with release_risk()."""
+        self.open_risk += max(0.0, amount)
+
     def release_risk(self, amount: float) -> None:
         """Called when a position's worst case improves (e.g. the second leg
         of a pair fills, locking in profit regardless of settlement)."""
